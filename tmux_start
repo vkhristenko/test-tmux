@@ -1,0 +1,142 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  tmux_start [-s <session>] -h <panes> [-h <panes> ...]
+  tmux_start [-s <session>] -v <columns> -h <panes>
+  tmux_start [-s <session>] -v <columns> -h <panes1> -h <panes2> ... -h <panesN>
+
+examples:
+  tmux_start -h 1
+  tmux_start -h 1 -h 2 -h 1
+  tmux_start -s dev -h 1 -h 2
+  tmux_start -v 3 -h 2
+EOF
+  exit 1
+}
+
+is_positive_integer() {
+  [[ "$1" =~ '^[0-9]+$' ]] && (( $1 >= 1 ))
+}
+
+die() {
+  echo "tmux_start: $*" >&2
+  exit 1
+}
+
+typeset -a pane_counts
+typeset -i columns=0
+session_name="main"
+
+while getopts ":s:v:h:" opt; do
+  case "$opt" in
+    s)
+      [[ -n "$OPTARG" ]] || die "-s expects a session name"
+      session_name="$OPTARG"
+      ;;
+    v)
+      is_positive_integer "$OPTARG" || die "-v expects a positive integer"
+      columns="$OPTARG"
+      ;;
+    h)
+      is_positive_integer "$OPTARG" || die "-h expects a positive integer"
+      pane_counts+=("$OPTARG")
+      ;;
+    :)
+      usage
+      ;;
+    \?)
+      usage
+      ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+(( $# == 0 )) || usage
+
+if (( ${#pane_counts[@]} == 0 )); then
+  die "provide at least one -h value"
+fi
+
+if (( columns > 0 )); then
+  if (( ${#pane_counts[@]} == 1 )); then
+    panes="${pane_counts[1]}"
+    pane_counts=()
+    for ((i = 1; i <= columns; i++)); do
+      pane_counts+=("$panes")
+    done
+  elif (( ${#pane_counts[@]} != columns )); then
+    die "-v ${columns} requires either one -h value or exactly ${columns} -h values"
+  fi
+fi
+
+quoted_command="${0:q}"
+quoted_command+=" -s ${session_name:q}"
+for panes in "${pane_counts[@]}"; do
+  quoted_command+=" -h ${panes:q}"
+done
+if (( columns > 0 )); then
+  quoted_command+=" -v ${columns:q}"
+fi
+
+if [[ -z "${TMUX:-}" ]]; then
+  if tmux has-session -t "$session_name" 2>/dev/null; then
+    target_window="$(tmux new-window -P -F '#{window_index}' -t "${session_name}:")"
+  else
+    tmux new-session -d -s "$session_name"
+    target_window=1
+  fi
+  tmux send-keys -t "${session_name}:${target_window}" "$quoted_command" C-m
+  tmux set-option -t "$session_name" status off
+  exec tmux attach-session -t "$session_name"
+fi
+
+current_session="$(tmux display-message -p '#S')"
+if [[ "$current_session" != "$session_name" ]]; then
+  if tmux has-session -t "$session_name" 2>/dev/null; then
+    target_window="$(tmux new-window -P -F '#{window_index}' -t "${session_name}:")"
+  else
+    tmux new-session -d -s "$session_name"
+    target_window=1
+  fi
+  tmux send-keys -t "${session_name}:${target_window}" "$quoted_command" C-m
+  tmux set-option -t "$session_name" status off
+  tmux switch-client -t "${session_name}:${target_window}"
+  exit 0
+fi
+
+window_target="$(tmux display-message -p '#S:#I')"
+session_target="$current_session"
+current_path="$(tmux display-message -p -t "$window_target" '#{pane_current_path}')"
+
+tmux set-option -t "$session_target" status off
+tmux kill-pane -a -t "$window_target"
+
+root_pane="$(tmux display-message -p -t "$window_target" '#{pane_id}')"
+typeset -a column_panes
+column_panes=("$root_pane")
+
+rightmost_pane="$root_pane"
+for ((i = 2; i <= ${#pane_counts[@]}; i++)); do
+  new_pane="$(tmux split-window -h -P -F '#{pane_id}' -t "$rightmost_pane" -c "$current_path")"
+  column_panes+=("$new_pane")
+  rightmost_pane="$new_pane"
+done
+
+if (( ${#column_panes[@]} > 1 )); then
+  tmux select-layout -t "$window_target" even-horizontal
+fi
+
+for ((i = 1; i <= ${#column_panes[@]}; i++)); do
+  pane_target="${column_panes[i]}"
+  panes="${pane_counts[i]}"
+
+  for ((row = 2; row <= panes; row++)); do
+    pane_target="$(tmux split-window -v -P -F '#{pane_id}' -t "$pane_target" -c "$current_path")"
+  done
+done
+
+tmux select-pane -t "${column_panes[1]}"
